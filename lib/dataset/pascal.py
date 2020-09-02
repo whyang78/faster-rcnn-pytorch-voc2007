@@ -3,7 +3,9 @@ import pickle
 import xml.etree.ElementTree as ET
 import numpy as np
 from PIL import Image
+import uuid
 from model.utils.config import cfg
+from model.utils.voc_eval import voc_eval
 
 def prepare_roidbs(imdb):
     num_images=imdb.num_images
@@ -137,6 +139,21 @@ class pascal_voc(object):
         # 该类中只是使用了gt_roidb，还有另外一种方法，此处没有细写
         self._roidb_handler=self.gt_roidb
 
+        # 评估所用
+        self._salt = str(uuid.uuid4()) # 当前网关和时间组成的随机字符串
+        self._comp_id = 'comp4'
+        self.config = {'cleanup': True, # 决定是否删除按类保存的检测结果
+                       'use_salt': True, # 保存检测结果进行命名时，是否添加随机数
+                       'use_diff': False,
+                       # 'matlab_eval': False, # 是否使用MATLAB版的评估，这里直接去掉了，咱不用
+                       'rpn_file': None,
+                       'min_size': 2}
+
+        assert os.path.exists(self._devkit_path), \
+            'VOCdevkit path does not exist: {}'.format(self._devkit_path)
+        assert os.path.exists(self._data_path), \
+            'Path does not exist: {}'.format(self._data_path)
+
     @property
     def num_classes(self):
         return len(self._classes)
@@ -152,6 +169,10 @@ class pascal_voc(object):
     @property
     def image_index(self):
         return self._image_index
+
+    @property
+    def name(self):
+        return self._name
 
     @property
     def roidb_handler(self):
@@ -202,6 +223,7 @@ class pascal_voc(object):
 
         for i,obj in enumerate(objs):
             bbox=obj.find('bndbox')
+            # voc数据集中坐标是one-base，这里转换成zero-base
             x1 = float(bbox.find('xmin').text) - 1
             y1 = float(bbox.find('ymin').text) - 1
             x2 = float(bbox.find('xmax').text) - 1
@@ -271,4 +293,94 @@ class pascal_voc(object):
             }
             self.roidb.append(entry)
         self._image_index=self._image_index * 2
+
+ #### 以下函数全部是用于测试评估
+
+    def competition_mode(self, on):
+        if on:
+            self.config['use_salt'] = False
+            self.config['cleanup'] = False
+        else:
+            self.config['use_salt'] = True
+            self.config['cleanup'] = True
+
+    def _get_comp_id(self):
+        # 注意competition_mode的设置
+        comp_id = (self._comp_id + '_' + self._salt if self.config['use_salt']
+                   else self._comp_id)
+        return comp_id
+
+    def _get_voc_results_file_template(self):
+        # VOCdevkit/results/VOC2007/Main/<comp_id>_det_test_aeroplane.txt
+        filename = self._get_comp_id() + '_det_' + self._image_set + '_{:s}.txt'
+        filedir = os.path.join(self._devkit_path, 'results', 'VOC' + self._year, 'Main')
+        if not os.path.exists(filedir):
+            os.makedirs(filedir)
+        path = os.path.join(filedir, filename)
+        return path
+
+    def _write_voc_results_file(self, all_boxes):
+        for cls_ind, cls in enumerate(self.classes):
+            if cls == '__background__':
+                continue
+            print('Writing {} VOC results file'.format(cls))
+            filename = self._get_voc_results_file_template().format(cls)
+            with open(filename, 'wt') as f:
+                for im_ind, index in enumerate(self.image_index):
+                    dets = all_boxes[cls_ind][im_ind]
+                    if dets == []:
+                        continue
+                    # VOC数据坐标是one-base，模型得到的结果是zero-base，故进行转换
+                    for k in range(dets.shape[0]):
+                        f.write('{:s} {:.3f} {:.1f} {:.1f} {:.1f} {:.1f}\n'.
+                                format(index, dets[k, -1],
+                                       dets[k, 0] + 1, dets[k, 1] + 1,
+                                       dets[k, 2] + 1, dets[k, 3] + 1))
+
+    def _do_python_eval(self, output_dir):
+        if not os.path.isdir(output_dir):
+            os.mkdir(output_dir)
+
+        annopath = os.path.join(
+            self._devkit_path,
+            'VOC' + self._year,
+            'Annotations',
+            '{:s}.xml')
+        imagesetfile = os.path.join(
+            self._devkit_path,
+            'VOC' + self._year,
+            'ImageSets',
+            'Main',
+            self._image_set + '.txt')
+        cachedir = os.path.join(self._devkit_path, 'annotations_cache') # 用于存储图像真实框的缓存文件路径
+        #PASCAL VOC评估方法主要有两种，在2010年发生变化
+        use_07_metric = True if int(self._year) < 2010 else False
+        print('VOC07 metric? ' + ('Yes' if use_07_metric else 'No'))
+
+        # 计算各类别的AP，并计算mAP，打印结果
+        aps = []
+        for i, cls in enumerate(self._classes):
+            if cls == '__background__':
+                continue
+            filename = self._get_voc_results_file_template().format(cls)
+            rec, prec, ap = voc_eval(
+                filename, annopath, imagesetfile, cls, cachedir, overlap_thresh=0.5,
+                use_07_metric=use_07_metric)
+            aps += [ap]
+            print('AP for {} = {:.4f}'.format(cls, ap))
+            with open(os.path.join(output_dir, cls + '_pr.pkl'), 'wb') as f:
+                pickle.dump({'rec': rec, 'prec': prec, 'ap': ap}, f)
+        print('Mean AP = {:.4f}'.format(np.mean(aps)))
+
+    def evaluate_detections(self, all_boxes, output_dir):
+        self._write_voc_results_file(all_boxes) # 将检测结果按类别分开保存下来(其实就是检测结果的缓存文件)
+        # 存储形式：各个TXT文档以类别命名，每个文档每行包含image_index_name、置信度、one-base坐标
+
+        self._do_python_eval(output_dir) # 评估
+        if self.config['cleanup']: # 决定是否删除按类保存的检测结果，即第一步代码保存的结果
+            for cls in self._classes:
+                if cls == '__background__':
+                    continue
+                filename = self._get_voc_results_file_template().format(cls)
+                os.remove(filename)
 

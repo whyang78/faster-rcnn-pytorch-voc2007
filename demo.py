@@ -256,7 +256,7 @@ if __name__ == '__main__':
             该过程中有三个阈值：
             （1）det_thresh：初步筛选阈值，该值一般较小，能够得到大量框
             （2）cfg.TEST.NMS: NMS阈值，用于删除重复框
-            （3）thresh：vis_detections参数，该值较det_thresh大（越大则筛选的框越准确），用于最终筛选
+            （3）thresh：vis_detections参数，该值较det_thresh大（越大则筛选的框越准确），仅可视化时使用
             '''
             # 初步筛选
             inds=torch.nonzero(scores[:,i]>det_thresh).view(-1)
